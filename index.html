@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="cs"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bulánci online</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#222;font-family:system-ui,sans-serif;color:#fff}
+canvas{display:block}
+#menu{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:#1b2330}
+#menu input,#menu button{font-size:18px;padding:10px 14px;border-radius:8px;border:0}
+#menu button{background:#e8a317;cursor:pointer;font-weight:700}
+#hud{position:fixed;top:8px;right:8px;background:#0008;padding:8px 12px;border-radius:8px;font-size:14px;min-width:170px}
+#hud table{width:100%}#hud td:nth-child(n+2){text-align:right;padding-left:10px}
+#info{position:fixed;top:8px;left:8px;background:#0008;padding:6px 10px;border-radius:8px;font-size:14px}
+#msg{position:fixed;bottom:40%;width:100%;text-align:center;font-size:28px;text-shadow:0 2px 4px #000}
+</style></head><body>
+<div id="menu">
+  <h1>🔫 Bulánci online</h1>
+  <input id="name" placeholder="Přezdívka" maxlength="12">
+  <button id="play">Hrát</button>
+  <div id="err" style="color:#f77"></div>
+</div>
+<div id="info" hidden></div><div id="hud" hidden></div><div id="msg"></div>
+<canvas id="c"></canvas>
+<script>
+const W=5000,H=5000,R=18,SPD=260,BSPD=900,DMG=25;
+const $=id=>document.getElementById(id);
+const cv=$('c'),ctx=cv.getContext('2d');
+let peer,isHost=false,myId=null,hostConn=null,conns=[];
+let players={},bullets=[],st={p:[],b:[]},disp={};
+const keys={},mouse={x:0,y:0,down:false};
+const COLS=['#e74c3c','#3498db','#2ecc71','#f1c40f','#9b59b6','#e67e22','#1abc9c','#fd79a8','#a29bfe','#dfe6e9'];
+function resize(){cv.width=innerWidth;cv.height=innerHeight}resize();onresize=resize;
+onkeydown=e=>keys[e.key.toLowerCase()]=1;onkeyup=e=>keys[e.key.toLowerCase()]=0;
+onmousemove=e=>{mouse.x=e.clientX;mouse.y=e.clientY};
+onmousedown=()=>mouse.down=true;onmouseup=()=>mouse.down=false;
+
+function err(m){$('err').textContent=m}
+function nick(){return ($('name').value.trim()||'Hráč'+Math.floor(Math.random()*99))}
+
+const ROOM='bulanci-main-v1'; // změň na něco unikátního pro svou hru
+let myName='',started=false,retry=null;
+$('play').onclick=()=>{myName=nick();connect()};
+function reset(){
+  isHost=false;conns=[];players={};bullets=[];hostConn=null;
+  if(peer){try{peer.destroy()}catch(e){}}peer=null;
+}
+function again(){
+  if(retry)return;
+  retry=setTimeout(()=>{retry=null;connect()},1000+Math.random()*1500);
+}
+function connect(){
+  const old=st.p.find(p=>p.id===myId),keep=old?{k:old.k,d:old.d}:{k:0,d:0};
+  reset();
+  peer=new Peer(ROOM); // kdo ID získá první, je hostitel
+  peer.on('open',()=>{
+    isHost=true;myId='host';addPlayer('host',myName,keep.k,keep.d);
+    $('info').textContent='Jsi hostitel (hra běží u tebe)';begin();
+  });
+  peer.on('connection',c=>{
+    c.on('open',()=>conns.push(c));
+    c.on('data',m=>{
+      if(m.t==='join')addPlayer(c.peer,m.name,m.k,m.d);
+      else if(m.t==='in'&&players[c.peer])players[c.peer].in=m.i;
+    });
+    const drop=()=>{conns=conns.filter(x=>x!==c);delete players[c.peer]};
+    c.on('close',drop);c.on('error',drop);
+  });
+  peer.on('error',e=>{
+    if(e.type==='unavailable-id')joinAsClient(keep);
+    else {err('Připojování… ('+e.type+')');again()}
+  });
+}
+function joinAsClient(keep){
+  reset();
+  peer=new Peer();
+  peer.on('error',e=>{err('Připojování… ('+e.type+')');again()});
+  peer.on('open',id=>{
+    myId=id;
+    hostConn=peer.connect(ROOM,{serialization:'json'});
+    hostConn.on('open',()=>{
+      hostConn.send({t:'join',name:myName,k:keep.k,d:keep.d});
+      $('info').textContent='Připojen do místnosti';begin();
+    });
+    hostConn.on('data',m=>{if(m.t==='s')st=m});
+    hostConn.on('close',again); // hostitel odešel -> zkusíme převzít roli
+  });
+}
+function begin(){
+  $('menu').hidden=true;$('info').hidden=false;$('hud').hidden=false;
+  if(started)return;started=true;
+  requestAnimationFrame(frame);setInterval(drawBoard,250);
+  setInterval(()=>{if(isHost)simulate()},33);
+  setInterval(()=>{if(!isHost&&hostConn&&hostConn.open)hostConn.send({t:'in',i:getInput()})},50);
+}
+
+function addPlayer(id,name,k,d){
+  players[id]={id,name,x:0,y:0,hp:100,k:k||0,d:d||0,a:0,cd:0,dead:0,rs:0,
+    col:COLS[Object.keys(players).length%COLS.length],in:{dx:0,dy:0,a:0,f:0}};
+  spawn(players[id]);
+}
+function spawn(p){p.x=100+Math.random()*(W-200);p.y=100+Math.random()*(H-200);p.hp=100;p.dead=0}
+
+function camera(){
+  const me=disp[myId]||{x:W/2,y:H/2};
+  return {x:Math.max(0,Math.min(W-cv.width,me.x-cv.width/2)),y:Math.max(0,Math.min(H-cv.height,me.y-cv.height/2)),me};
+}
+function getInput(){
+  const cam=camera(),me=cam.me;
+  const dx=(keys.d||keys.arrowright?1:0)-(keys.a||keys.arrowleft?1:0);
+  const dy=(keys.s||keys.arrowdown?1:0)-(keys.w||keys.arrowup?1:0);
+  const a=Math.atan2(mouse.y-(me.y-cam.y),mouse.x-(me.x-cam.x));
+  return {dx,dy,a,f:(mouse.down||keys[' '])?1:0};
+}
+
+let last=performance.now();
+function simulate(){
+  const now=performance.now(),dt=Math.min(0.1,(now-last)/1000);last=now;
+  players.host.in=getInput();
+  for(const id in players){
+    const p=players[id];
+    if(p.dead){p.rs-=dt;if(p.rs<=0)spawn(p);continue}
+    let {dx,dy,a,f}=p.in;const l=Math.hypot(dx,dy)||1;
+    p.x=Math.max(R,Math.min(W-R,p.x+dx/l*SPD*dt*(dx||dy?1:0)));
+    p.y=Math.max(R,Math.min(H-R,p.y+dy/l*SPD*dt*(dx||dy?1:0)));
+    p.a=a;p.cd-=dt;
+    if(f&&p.cd<=0){p.cd=0.25;bullets.push({x:p.x+Math.cos(a)*R,y:p.y+Math.sin(a)*R,vx:Math.cos(a)*BSPD,vy:Math.sin(a)*BSPD,o:id,life:0.9})}
+  }
+  bullets=bullets.filter(b=>{
+    b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt;
+    if(b.life<=0||b.x<0||b.y<0||b.x>W||b.y>H)return false;
+    for(const id in players){
+      const p=players[id];
+      if(id===b.o||p.dead)continue;
+      if(Math.hypot(p.x-b.x,p.y-b.y)<R+4){
+        p.hp-=DMG;
+        if(p.hp<=0){p.dead=1;p.rs=2.5;p.d++;const o=players[b.o];if(o)o.k++}
+        return false;
+      }
+    }
+    return true;
+  });
+  const snap={t:'s',p:Object.values(players).map(p=>({id:p.id,n:p.name,x:Math.round(p.x),y:Math.round(p.y),hp:p.hp,k:p.k,d:p.d,a:+p.a.toFixed(2),c:p.col,dead:p.dead})),
+    b:bullets.map(b=>[Math.round(b.x),Math.round(b.y)])};
+  st=snap;
+  conns.forEach(c=>c.open&&c.send(snap));
+}
+
+function frame(){
+  for(const p of st.p){
+    const d=disp[p.id]||(disp[p.id]={x:p.x,y:p.y});
+    d.x+=(p.x-d.x)*0.4;d.y+=(p.y-d.y)*0.4;
+  }
+  const cam=camera(),cx=cam.x,cy=cam.y;
+  ctx.fillStyle='#3d6b3a';ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.strokeStyle='#ffffff18';ctx.lineWidth=1;ctx.beginPath();
+  for(let x=Math.floor(cx/100)*100;x<=cx+cv.width;x+=100){ctx.moveTo(x-cx,0);ctx.lineTo(x-cx,cv.height)}
+  for(let y=Math.floor(cy/100)*100;y<=cy+cv.height;y+=100){ctx.moveTo(0,y-cy);ctx.lineTo(cv.width,y-cy)}
+  ctx.stroke();
+  ctx.strokeStyle='#000';ctx.lineWidth=6;ctx.strokeRect(-cx,-cy,W,H);
+  ctx.fillStyle='#ffe44d';
+  for(const b of st.b){ctx.beginPath();ctx.arc(b[0]-cx,b[1]-cy,5,0,7);ctx.fill()}
+  for(const p of st.p){
+    if(p.dead)continue;
+    const d=disp[p.id],x=d.x-cx,y=d.y-cy;
+    ctx.strokeStyle='#222';ctx.lineWidth=7;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(p.a)*(R+14),y+Math.sin(p.a)*(R+14));ctx.stroke();
+    ctx.fillStyle=p.c;ctx.beginPath();ctx.arc(x,y,R,0,7);ctx.fill();ctx.lineWidth=3;ctx.strokeStyle=p.id===myId?'#fff':'#000';ctx.stroke();
+    ctx.fillStyle='#000a';ctx.fillRect(x-20,y-R-14,40,5);ctx.fillStyle='#e33';ctx.fillRect(x-20,y-R-14,40*p.hp/100,5);
+    ctx.fillStyle='#fff';ctx.font='12px sans-serif';ctx.textAlign='center';ctx.fillText(p.n,x,y-R-18);
+  }
+  const me=st.p.find(p=>p.id===myId);
+  $('msg').textContent=me&&me.dead?'Byl jsi zničen… oživení za chvilku':'';
+  requestAnimationFrame(frame);
+}
+function drawBoard(){
+  const rows=[...st.p].sort((a,b)=>b.k-a.k||a.d-b.d).map((p,i)=>
+    `<tr style="color:${p.c};font-weight:${p.id===myId?700:400}"><td>${i+1}. ${p.n.replace(/[<>&]/g,'')}</td><td>${p.k}</td><td>${p.d}</td></tr>`).join('');
+  $('hud').innerHTML=`<b>Žebříček</b> (zabití / smrti)<table>${rows}</table>`;
+}
+</script></body></html>
