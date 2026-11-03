@@ -24,11 +24,11 @@ canvas{display:block;width:100vw;height:100vh;object-fit:contain}
 <div id="s">Připojování…</div><div id="h">WASD / šipky · mezerník = střelba</div>
 <script>
 const W=1920,H=1080,S=40,SPD=300,BSPD=700;
-let ROOM='',label='';
+let ROOM='',label='',lastRx=0,linked=false;
 const cv=document.getElementById('c'),ctx=cv.getContext('2d'),info=document.getElementById('s');
 const COLS=['#e74c3c','#3498db','#2ecc71','#f1c40f','#9b59b6','#e67e22','#1abc9c','#fd79a8','#a29bfe','#dfe6e9'];
 const DIRS={w:[0,-1],arrowup:[0,-1],s:[0,1],arrowdown:[0,1],a:[-1,0],arrowleft:[-1,0],d:[1,0],arrowright:[1,0]};
-let peer=null,isHost=false,myId=null,hostConn=null,conns=[],retry=null,nextCol=0;
+let peer=null,isHost=false,myId=null,hostConn=null,conns=[],nextCol=0;
 let players={},bullets=[],st={p:[],b:[]},disp={},stack=[],fire=false;
 
 /* ovládání */
@@ -44,17 +44,17 @@ function setIn(p,m){p.dx=Math.sign(m.dx|0);p.dy=Math.sign(m.dy|0);if(p.dx&&p.dy)
 /* spojení: kdo získá ID místnosti jako první, je host; ostatní se připojí.
    Když host odejde, všichni to zkusí znovu a jeden z nich převezme roli. */
 function reset(){
-  isHost=false;conns=[];players={};bullets=[];hostConn=null;
+  isHost=false;conns=[];players={};bullets=[];hostConn=null;linked=false;lastRx=Date.now();
   if(peer){try{peer.destroy()}catch(e){}}peer=null;
 }
-function again(){
-  info.textContent='Připojování…';
-  if(retry)return;
-  retry=setTimeout(()=>{retry=null;connect()},1000+Math.random()*1500);
+function toMenu(){ // jakýkoli problém se spojením = zpět na úvodní obrazovku
+  reset();ROOM='';label='';st={p:[],b:[]};disp={};
+  document.getElementById('menu').hidden=false;info.textContent='';
 }
 function connect(){
   reset();
   peer=new Peer(ROOM);
+  const me=peer,out=()=>{if(peer===me)toMenu()}; // ignoruje události starých spojení
   peer.on('open',()=>{isHost=true;myId='host';addPlayer('host');info.textContent='Jsi hostitel · '+label});
   peer.on('connection',c=>{
     c.on('open',()=>{conns.push(c);addPlayer(c.peer)});
@@ -62,20 +62,28 @@ function connect(){
     const drop=()=>{conns=conns.filter(x=>x!==c);delete players[c.peer]};
     c.on('close',drop);c.on('error',drop);
   });
-  peer.on('error',e=>{if(e.type==='unavailable-id')join();else again()});
+  peer.on('error',e=>{if(e.type==='unavailable-id')join();else out()});
 }
 function join(){
   reset();
   peer=new Peer();
-  peer.on('error',again);
+  const me=peer,out=()=>{if(peer===me)toMenu()};
+  peer.on('error',out);
   peer.on('open',id=>{
     myId=id;
     hostConn=peer.connect(ROOM,{serialization:'json'});
     hostConn.on('open',()=>info.textContent='Připojen · '+label);
-    hostConn.on('data',m=>{if(m.t==='s')st=m});
-    hostConn.on('close',again);
+    hostConn.on('data',m=>{if(m.t==='s'){st=m;lastRx=Date.now();linked=true}});
+    hostConn.on('error',out);
+    hostConn.on('close',out);
   });
 }
+/* hlídač: když od hosta 5 s nepřijde stav, hra končí a vrátí se na úvodní obrazovku */
+setInterval(()=>{
+  if(!ROOM||isHost)return;
+  if(Date.now()-lastRx>(linked?5000:10000))toMenu();
+},500);
+
 /* start: název místnosti se zadá jen jednou; při převzetí hostování zůstává stejný */
 const $=id=>document.getElementById(id);
 $('room').value=decodeURIComponent(location.hash.slice(1));
@@ -83,7 +91,7 @@ function start(){
   const n=$('room').value.trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
     .replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,30);
   if(n.length<3)return $('err').textContent='Zadej název místnosti (aspoň 3 znaky).';
-  label=n;ROOM='fps-'+n;location.hash=n;
+  label=n;ROOM='fps-'+n;location.hash=n;info.textContent='Připojování…';
   $('menu').hidden=true;connect();
 }
 $('go').onclick=start;
@@ -91,7 +99,7 @@ $('room').addEventListener('keydown',e=>{if(e.key==='Enter')start()});
 
 /* hra (počítá host) */
 function addPlayer(id){const p=players[id]={id,col:nextCol++%10,fx:0,fy:1,dx:0,dy:0,f:0,cd:0,rs:0};spawn(p)}
-function spawn(p){p.x=S+Math.random()*(W-2*S);p.y=S+Math.random()*(H-2*S);p.hp=3;p.dead=0}
+function spawn(p){p.x=S+Math.random()*(W-2*S);p.y=S+Math.random()*(H-2*S);p.dead=0}
 let last=Date.now();
 setInterval(()=>{
   if(!isHost||!players.host)return;
@@ -103,17 +111,17 @@ setInterval(()=>{
       p.x=Math.max(S/2,Math.min(W-S/2,p.x+p.dx*SPD*dt));
       p.y=Math.max(S/2,Math.min(H-S/2,p.y+p.dy*SPD*dt))}
     p.cd-=dt;
-    if(p.f&&p.cd<=0){p.cd=0.3;bullets.push({x:p.x+p.fx*S/2,y:p.y+p.fy*S/2,vx:p.fx*BSPD,vy:p.fy*BSPD,o:p.id,life:1.5})}}
+    if(p.f&&p.cd<=0){p.cd=0.3;bullets.push({x:p.x+p.fx*S/2,y:p.y+p.fy*S/2,vx:p.fx*BSPD,vy:p.fy*BSPD,o:p.id})}}
   bullets=bullets.filter(b=>{
-    b.x+=b.vx*dt;b.y+=b.vy*dt;b.life-=dt;
-    if(b.life<=0||b.x<0||b.y<0||b.x>W||b.y>H)return false;
+    b.x+=b.vx*dt;b.y+=b.vy*dt;
+    if(b.x<0||b.y<0||b.x>W||b.y>H)return false; // kulka zanikne na kraji místnosti
     for(const id in players){const p=players[id];
       if(p.id===b.o||p.dead)continue;
       if(Math.abs(p.x-b.x)<S/2+4&&Math.abs(p.y-b.y)<S/2+4){
-        if(--p.hp<=0){p.dead=1;p.rs=2}
+        p.dead=1;p.rs=2; // jeden zásah = smrt
         return false}}
     return true});
-  st={t:'s',p:Object.values(players).map(p=>[p.id,Math.round(p.x),Math.round(p.y),p.fx,p.fy,p.hp,p.dead,p.col]),
+  st={t:'s',p:Object.values(players).map(p=>[p.id,Math.round(p.x),Math.round(p.y),p.fx,p.fy,p.dead,p.col]),
       b:bullets.map(b=>[Math.round(b.x),Math.round(b.y)])};
   for(const c of conns)if(c.open)c.send(st);
 },33);
@@ -126,13 +134,12 @@ function frame(){
   ctx.fillStyle='#ffe44d';
   for(const b of st.b)ctx.fillRect(b[0]-4,b[1]-4,8,8);
   for(const p of st.p){
-    if(p[6])continue;
+    if(p[5])continue;
     const d=disp[p[0]]||(disp[p[0]]={x:p[1],y:p[2]});
     d.x+=(p[1]-d.x)*0.4;d.y+=(p[2]-d.y)*0.4;
-    ctx.fillStyle=COLS[p[7]];ctx.fillRect(d.x-S/2,d.y-S/2,S,S);
+    ctx.fillStyle=COLS[p[6]];ctx.fillRect(d.x-S/2,d.y-S/2,S,S);
     if(p[0]===myId){ctx.strokeStyle='#fff';ctx.lineWidth=3;ctx.strokeRect(d.x-S/2,d.y-S/2,S,S)}
     ctx.fillStyle='#222';ctx.fillRect(d.x+p[3]*S/2-6,d.y+p[4]*S/2-6,12,12); // směr střelby
-    ctx.fillStyle='#e33';ctx.fillRect(d.x-S/2,d.y-S/2-10,S*p[5]/3,5);
   }
   requestAnimationFrame(frame);
 }
